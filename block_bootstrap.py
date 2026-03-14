@@ -96,13 +96,15 @@ class SimulatedInvestor:
                  avg_residence_length=AVG_RESIDENCE_LENGTH,
                  sigma=SIGMA,
                  mu=MU,
-                 shape=SHAPE):
+                 shape=SHAPE,
+                 should_maximize_entropy=False):
 
         self.min_year = min_year
         self.max_year = max_year
 
         self.age_at_start = age_at_start
         self.avg_residence_length = avg_residence_length
+        self.should_maximize_entropy = should_maximize_entropy
 
         self.countries = countries
         self.country_probabilities = country_probabilities
@@ -175,10 +177,54 @@ class SimulatedInvestor:
             if self.time_after_retirement(t) > 0:
                 return self.time_after_retirement(t)
 
+    ### MAXIMUM ENTROPY MODIFICATION OF TRAJECTORIES ###
+    # returns perturbed version of the trajectory that has, for each dimension,
+    # the same relative temporal ordering of values.
+
+    @staticmethod
+    def resample_with_max_entropy(trajectory):  # trajectory an np array of shape (N, D)
+        # WARNING: method assumes no duplicate values per dimension!
+        n, d = trajectory.shape
+
+        if n <= 1:
+            return trajectory
+
+        perturbed_trajectory = np.zeros(trajectory.shape)
+
+        for i in range(d):
+            x = trajectory[:, i]  # has the time ordering
+            x_sorted = np.sort(x)  # has the value ordering
+
+            for t in range(n):
+                t_order = np.where(x_sorted == x[t])[0][0]  # x_sorted[t_order] = x[t]
+                left = 0
+                right = n - 1
+
+                # 1) set up bounds of uniform distribution
+                if t_order == 0:
+                    left = x_sorted[0] - (1 / 2) * (x_sorted[1] - x_sorted[0])
+                    right = (1 / 2) * (x_sorted[0] + x_sorted[1])
+
+                elif t_order == n - 1:
+                    left = (1 / 2) * (x_sorted[-2] + x_sorted[-1])
+                    right = x_sorted[-1] + (1 / 2) * (x_sorted[-1] - x_sorted[-2])
+
+                else:
+                    left = (1 / 2) * (x_sorted[t_order - 1] + x_sorted[t_order])
+                    right = (1 / 2) * (x_sorted[t_order] + x_sorted[t_order + 1])
+
+                x_hat_t = np.random.uniform(low=left, high=right)
+                perturbed_trajectory[t, i] = x_hat_t
+                if x_hat_t is None:
+                    print(f'x_hat_t error! {x_hat_t}')
+
+        return perturbed_trajectory
+
     ### BLOCK BOOTSTRAP METHOD ###
     def get_trajectory(self, total_time_steps: int):
         """
             'observation' = asset returns AND macro variable returns (used to be called 'state')
+            if should_maximize_entropy == True, apply the static method above before returning
         """
 
         # returns sequence of observations (about 30 in length) for one investor's life
@@ -248,6 +294,9 @@ class SimulatedInvestor:
                 time_elapsed += 1
                 if time_elapsed == total_time_steps:
                     break
+
+        if self.should_maximize_entropy:
+            time_series_of_observations = self.resample_with_max_entropy(time_series_of_observations)
 
         return time_series_of_observations
 
