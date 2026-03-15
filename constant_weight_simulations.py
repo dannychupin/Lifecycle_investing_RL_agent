@@ -14,10 +14,16 @@ from block_bootstrap import SimulatedInvestor
 SEED = 42
 np.random.seed(SEED)
 
-# change these in ablations (e.g. post-WWII changes things?)
+# I. FULL LIST OF DEFAULT HYPERPARAMETERS (CHANGE THESE IN ABLATIONS BELOW)
 MIN_YEAR = 1871     # set to 1870+1 to calculate %change from prev year of macro variables (cpi, gdp, wages)
 MAX_YEAR = 2020
 AVG_RESIDENCE_LENGTH = 10  # take as the mean of geometric distribution
+
+ASSET_PROXY_LIST = [['eq_tr', 'eq_capgain', 'eq_div_rtn'], ['housing_tr', 'housing_capgain', 'housing_rent_rtn'],
+                    ['bond_tr', 'bond_rate'], ['bill_rate']]
+
+# will change the following absolute vars into returns (using previous years)
+MACRO_LIST = [['gdp'], ['cpi']]     # CONVENTION: INFLATION IS ALWAYS LAST (it is most important)
 
 # change these in ablations (to shape what kind of 'average investor' we are modeling)
 COUNTRIES = ['Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
@@ -25,33 +31,73 @@ COUNTRIES = ['Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
              'Ireland', 'Italy', 'Japan', 'Netherlands', 'Norway',
              'Portugal', 'Sweden', 'USA']   # 18 countries
 
+# II. PARTICULAR CHOICE FOR THIS SIMULATION
+
+ALLOWED_COUNTRIES = ['Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
+                     'Denmark', 'Spain', 'Finland', 'France', 'UK',
+                     'Ireland', 'Italy', 'Japan', 'Netherlands', 'Norway',
+                     'Portugal', 'Sweden', 'USA']  # keep all
+
+MARKET_CAPS = {"Australia": 1700, "Belgium": 250, "Canada": 4035, "Switzerland": 3089, "Germany": 3112,
+               "Denmark": 700, "Spain": 900, "Finland": 350, "France": 3376, "UK": 4552,
+               "Ireland": 300, "Italy": 800, "Japan": 7165, "Netherlands": 1500, "Norway": 450,
+               "Portugal": 110, "Sweden": 1100, "USA": 70384}       # in billions USD, 2025-2026 estimate
+
+MARKET_CAPS_LIST = np.array(list(MARKET_CAPS.values()))
+MARKET_CAPS_PROBABILITIES = MARKET_CAPS_LIST / MARKET_CAPS_LIST.sum()
+UNIFORM_PROBABILITIES = np.array([1/len(ALLOWED_COUNTRIES) for _ in ALLOWED_COUNTRIES])
+
+probabilities_dict = {'uniform wts': UNIFORM_PROBABILITIES, 'mkt cap wts': MARKET_CAPS_PROBABILITIES}
+
+ALLOWED_ASSETS = [['eq_tr', 'eq_capgain', 'eq_div_rtn'], ['bond_tr', 'bond_rate']]  # just keep equity and bonds
+ALLOWED_MACROS = [['cpi']]         # just need cpi (for inflation adjustment)
+
+
 # hyperparameters for simulation
 NUM_TRAJECTORIES = 200
 STARTING_WEALTH = 1_000_000
 BETA = 0.04
+WITHDRAW = BETA * STARTING_WEALTH
+MAX_WEALTH = 10_000_000         # for clipping
 
 
 ### I. SIMULATION ###
 
-def get_financial_update(observation, weights, wealth_old, withdraw_old):
+"""
+    March 15 update: everything changed from NOMINAL amounts to REAL (i.e. inflation-adjusted).
+    
+    Thus, terminal and starting wealths are both measured in utils, and are thus comparable
+    Also: fixed bug that over-counted financial ruin probability
+    
+"""
 
-    # extract info
-    asset_returns = observation[:ACTION_DIMENSION]
+
+def nominal_to_real_observation(observation):
+
+    nominal_returns = observation[:-1]
     inflation_rate = observation[-1]
 
-    # update `withdraw_old` to keep up with recent inflation
-    withdraw = (1 + inflation_rate) * withdraw_old
+    real_returns = nominal_returns - inflation_rate     # broadcast -inflation_rate to np.array of nominal returns
 
-    # update `wealth_old` with new returns from `state`, then withdraw
-    wealth = wealth_old * (1 + np.dot(asset_returns, weights)) - withdraw
+    return real_returns
 
-    return wealth, withdraw
+
+def get_financial_update(observation_real, action_old, wealth_old):
+
+    # extract relevant state info for update. Uses only real inputs
+    asset_returns_real = observation_real[:ACTION_DIMENSION]
+
+    # update `wealth_old` with new real return, then withdraw
+    wealth = wealth_old * (1 + np.dot(asset_returns_real, action_old)) - WITHDRAW
+
+    return wealth
 
 
 def try_strategies(avg_length_of_residence,
                    country_probabilities,
                    strategies,
                    allowed_countries=COUNTRIES,
+                   should_maximize_entropy=False,
                    num_trajectories=NUM_TRAJECTORIES):
 
     # initialize simulation
@@ -59,6 +105,7 @@ def try_strategies(avg_length_of_residence,
                                  asset_proxy_list=ALLOWED_ASSETS,
                                  macro_list=ALLOWED_MACROS,
                                  country_probabilities=country_probabilities,
+                                 should_maximize_entropy=should_maximize_entropy,
                                  avg_residence_length=avg_length_of_residence)
 
     num_strategies = len(strategies)
@@ -69,44 +116,52 @@ def try_strategies(avg_length_of_residence,
     start_time = time.time()
     print('Beginning simulation...')
 
-    for i in range(num_trajectories):
+    # main purpose: initialize a trajectory, and then evaluate all strategies on it
 
-        # initialize wealth, and get trajectory
-        wealth_list = np.full(shape=num_strategies, fill_value=STARTING_WEALTH)
-        withdraw_list = np.full(shape=num_strategies, fill_value=BETA*STARTING_WEALTH)
+    for i in range(num_trajectories):
+        print('')
+        print(f'New trajectory {i}!')
+
+        # initialize wealth, and get trajectory of nominal returns
+        real_wealth_list = np.full(shape=num_strategies, fill_value=STARTING_WEALTH)
         trajectory_length = investor.generate_time_after_retirement()
         trajectory = investor.get_trajectory(trajectory_length)
 
+        # go through trajectory, and record when each strategy leads to ruin
+        # THIS IS IMPORTANT! Ruin can occur at most once for trajectory-strategy pair
+
+        is_ruined = [False for _ in range(num_strategies)]
+
         for t in range(trajectory_length):
 
-            # get observation
+            # get real observation
             observation = trajectory[t]
+            observation_real = nominal_to_real_observation(observation)
 
-            # withdraw, and update wealth
-            for j, weights in enumerate(strategies):
+            # for each strategy: withdraw, and update wealth
+            for j, constant_action in enumerate(strategies):
 
-                wealth = wealth_list[j]
-                withdraw = withdraw_list[j]
+                real_wealth = real_wealth_list[j]
 
-                # get updates
-                wealth_new, withdraw_new = get_financial_update(observation=observation,
-                                                                weights=weights,
-                                                                wealth_old=wealth,
-                                                                withdraw_old=withdraw)
+                # get real wealth update after action and withdrawal, clipped
+                real_wealth_new = get_financial_update(observation_real=observation_real,
+                                                       action_old=constant_action,
+                                                       wealth_old=real_wealth)
+                real_wealth_new = np.clip(real_wealth_new, 0., MAX_WEALTH)
 
-                # check to see if I'm broke; if so,
-                if wealth_new <= 0:
-                    wealth_new = 0
-                    withdraw_new = 0
-                    financial_ruin[i, j] = 1
+                # check to see if I'm broke for the first time; if so, update financial ruin
+                if real_wealth_new == 0:
+                    if not is_ruined[j]:
+                        is_ruined[j] = True
+                        financial_ruin[i, j] = 1
+                        print(f'-strategy {j} ruined at time {t}')
 
                 # update values
-                wealth_list[j] = wealth_new
-                withdraw_list[j] = withdraw_new
+                real_wealth_list[j] = real_wealth_new
 
             # at the end of trajectory, record terminal wealth
             if t == trajectory_length - 1:
-                terminal_wealth[i] = wealth_list
+                terminal_wealth[i] = real_wealth_list
 
         if (i + 1) % 100 == 0:
             print(f'Trajectory {i + 1} complete!')
@@ -118,9 +173,6 @@ def try_strategies(avg_length_of_residence,
 
     return terminal_wealth, financial_ruin_list
 
-# optionally truncate distributions at this wealth
-MAX_TERMINAL_WEALTH = 1e7       # serves as max wealth window in histograms
-
 
 def plot_and_save_results(terminal_wealth,
                           financial_ruin_list,
@@ -129,17 +181,11 @@ def plot_and_save_results(terminal_wealth,
                           probs_name,
                           save_filename,
                           num_trajectories=NUM_TRAJECTORIES,
-                          should_truncate=True,
                           num_bins=100):
-
-    # optionally truncate. This is to give sensible means to mostly-stock strategies
-    if should_truncate:
-        terminal_wealth[terminal_wealth > MAX_TERMINAL_WEALTH] = MAX_TERMINAL_WEALTH
 
     fig, axes = plt.subplots(nrows=2, ncols=len(strategies)//2+1, figsize=(14, 7))
     axes = axes.ravel()
 
-    range_hist = (0, MAX_TERMINAL_WEALTH)
     y_lim = (1/15) * NUM_TRAJECTORIES
 
     strategy_names = [f'{int(strategy[0] * 100)}% stocks' for strategy in strategies]
@@ -152,7 +198,7 @@ def plot_and_save_results(terminal_wealth,
         terminal_wealth_i = terminal_wealth[:, i]
 
         # plot
-        axes[i].hist(np.array(terminal_wealth_i), bins=num_bins, range=range_hist)
+        axes[i].hist(np.array(terminal_wealth_i), bins=num_bins)
         axes[i].set_title(strategy_name)
         axes[i].set_xlabel('Wealth')
         axes[i].set_ylim(0, y_lim)
@@ -169,11 +215,11 @@ def plot_and_save_results(terminal_wealth,
     axes[-1].bar(np.array(strategy_names), financial_ruin_list)
     axes[-1].set_title(f'Prob(financial ruin)')
 
-    fig.suptitle(f'Terminal wealth for given % stocks ({avg_residence_len} yr avg len, '
+    fig.suptitle(f'Real terminal wealth for given % stocks ({avg_residence_len} yr avg len, '
                  f'{probs_name}, {num_trajectories} trajectories)', fontsize=16)
     fig.tight_layout()
-    plt.savefig(save_filename)
-    # plt.show()
+    # plt.savefig(save_filename)
+    plt.show()
 
 
 ### III. RUN ON CONSTANT ALLOCATION STRATEGIES ###
@@ -204,7 +250,7 @@ def main(num_strategies,
                                                                   country_probabilities=probabilities_dict[probs_name],
                                                                   allowed_countries=ALLOWED_COUNTRIES)
 
-            file_name = f'Term wealth ({len} yrs, {probs_name}, {num_trajectories} traj).png'
+            file_name = f'(S + RE) Real term wealth ({len} yrs, {probs_name}, {num_trajectories} traj).png'
             complete_file_path = base_path + file_name
 
             plot_and_save_results(terminal_wealth=terminal_wealth,
@@ -214,37 +260,17 @@ def main(num_strategies,
                                   probs_name=probs_name,
                                   save_filename=complete_file_path,
                                   num_trajectories=num_trajectories,
-                                  should_truncate=True,
                                   num_bins=100)
 
     print('All done!')
 
-ALLOWED_COUNTRIES = ['Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
-                     'Denmark', 'Spain', 'Finland', 'France', 'UK',
-                     'Ireland', 'Italy', 'Japan', 'Netherlands', 'Norway',
-                     'Portugal', 'Sweden', 'USA']  # keep all
-
-MARKET_CAPS = {"Australia": 1700, "Belgium": 250, "Canada": 4035, "Switzerland": 3089, "Germany": 3112,
-               "Denmark": 700, "Spain": 900, "Finland": 350, "France": 3376, "UK": 4552,
-               "Ireland": 300, "Italy": 800, "Japan": 7165, "Netherlands": 1500, "Norway": 450,
-               "Portugal": 110, "Sweden": 1100, "USA": 70384}       # in billions USD, 2025-2026 estimate
-
-MARKET_CAPS_LIST = np.array(list(MARKET_CAPS.values()))
-MARKET_CAPS_PROBABILITIES = MARKET_CAPS_LIST / MARKET_CAPS_LIST.sum()
-UNIFORM_PROBABILITIES = np.array([1/len(ALLOWED_COUNTRIES) for _ in ALLOWED_COUNTRIES])
-
-probabilities_dict = {'uniform wts': UNIFORM_PROBABILITIES, 'mkt cap wts': MARKET_CAPS_PROBABILITIES}
-
-ALLOWED_ASSETS = [['eq_tr', 'eq_capgain', 'eq_div_rtn'], ['bond_tr', 'bond_rate']]  # just keep equity and bonds
-ALLOWED_MACROS = [['cpi']]         # just need cpi (for inflation adjustment)
-
 ACTION_DIMENSION = len(ALLOWED_ASSETS)
-NUM_TRAJECTORIES = 10_000
+NUM_TRAJECTORIES = 1_000
 
 # list of constant weight strategies: [stock_wt, bond_wt]
 NUM_STRATEGIES = 10     # make it even
 
 main(num_strategies=NUM_STRATEGIES,
-     avg_len_list=[5, 10],
+     avg_len_list=[10],
      probabilities_dict=probabilities_dict,
      num_trajectories=NUM_TRAJECTORIES)
