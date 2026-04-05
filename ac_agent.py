@@ -375,7 +375,8 @@ class ActorCritic:
         self.Q1.train()
         self.Q1_optimizer.zero_grad(set_to_none=True)
         Q1_value_batch = self.Q1.forward(state_batch, action_batch).squeeze(-1)
-        Q1_loss = F.smooth_l1_loss(target_future_rewards_batch, Q1_value_batch)
+        Q1_loss = torch.mean((target_future_rewards_batch - Q1_value_batch) ** 2)
+        # alternative loss: Q1_loss = F.smooth_l1_loss(target_future_rewards_batch, Q1_value_batch)
         Q1_loss_copy = Q1_loss.detach().clone()  # record Q1 loss to track learning
 
         Q1_loss.backward()
@@ -388,7 +389,8 @@ class ActorCritic:
         self.Q2.train()
         self.Q2_optimizer.zero_grad(set_to_none=True)
         Q2_value_batch = self.Q2.forward(state_batch, action_batch).squeeze(-1)
-        Q2_loss = F.smooth_l1_loss(target_future_rewards_batch, Q2_value_batch)
+        Q2_loss = torch.mean((target_future_rewards_batch - Q2_value_batch) ** 2)
+        # alternative loss: Q2_loss = F.smooth_l1_loss(target_future_rewards_batch, Q2_value_batch)
         Q2_loss_copy = Q2_loss.detach().clone()  # record Q2 loss to track learning
 
         Q2_loss.backward()
