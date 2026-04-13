@@ -3,21 +3,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from math import floor
-import time
 
-"""data source: https://www.macrohistory.net/database/
+"""Data source: https://www.macrohistory.net/database/
     
     NOTES:
-    -all returns NOMINAL (so, we would need to track inflation)
+    -all returns NOMINAL (we will track cpi to turn these into REAL returns)
     -all returns in LOCAL CURRENCY
-    -baseline for CPI is 1990
+    -baseline for cpi is 1990
     
-    NOT ALL FIELDS HAVE DATA!
+    WARNING: not all fields have data!
     -lots of `NaN` values, especially in times of war/economic crisis.
-    ==> need to check for missing data in the block bootstrap
+    ==> need to check for missing data in the block bootstrap simulation
 """
 
-### I. LOAD DATA ###
+################
+# I. LOAD DATA #
+################
 
 # set file path and load data
 file_path = '/Users/danielchupin/Desktop/Rate_of_return_project/JSTdatasetR6.xlsx'
@@ -41,22 +42,21 @@ ASSET_RETURN_NAMES = ['eq_tr', 'housing_tr', 'bond_tr', 'bill_rate']
     'bill_rate'     = bill total returns: returns on short-term (2-6 months) government bonds
 """
 
-# combine assets and their proxies. The simulation takes the first value available
-# (e.g. if eq_tr not available, see if eq_capgain is. If not, see if eq_div_rtn is)
+# combine assets and their proxies
+# the simulation will take the first value in each list that is available
 # KEY: if at least one asset has all proxies 'NaN', SKIP THAT YEAR, AND SKIP TO NEXT COUNTRY
 
-ASSET_PROXY_LIST = [['eq_tr', 'eq_capgain', 'eq_div_rtn'], ['housing_tr', 'housing_capgain', 'housing_rent_rtn'],
-                    ['bond_tr', 'bond_rate'], ['bill_rate']]
+ASSET_PROXY_LIST = [['eq_tr', 'eq_capgain', 'eq_div_rtn'],
+                    ['housing_tr', 'housing_capgain', 'housing_rent_rtn'],
+                    ['bond_tr', 'bond_rate'],
+                    ['bill_rate']]
 
-# will change the following absolute vars into returns (using previous years)
+# track macro variables, in particular cpi to calculate inflation rate, to turn NOMINAL into REAL returns
 MACRO_LIST = [['gdp'], ['cpi']]     # CONVENTION: INFLATION IS ALWAYS LAST (it is most important)
 
-# RMK: can try to produce INTERNATIONAL stocks/bond/housing return data, by using the exchange rate to US 'xrusd'?
-# issue: would need to determine capitalization of each country's stock/bond market...
-# ... or some other sensible weight for each country in an international index fund
-
-
-### II. CONSTRUCT SIMULATION ###
+############################
+# II. CONSTRUCT SIMULATION #
+############################
 
 # hyperparameters for getting trajectories
 AGE_AT_START = 30
@@ -65,21 +65,22 @@ MU = 79.3
 SIGMA = 32.8
 SHAPE = 132.2
 
-# change these in ablations (e.g. post-WWII changes things?)
+# change these in ablations
 MIN_YEAR = 1871     # set to 1870+1 to calculate %change from prev year of macro variables (cpi, gdp, wages)
 MAX_YEAR = 2020
-AVG_RESIDENCE_LENGTH = 10  # take as the mean of geometric distribution
+AVG_RESIDENCE_LENGTH = 10  # MOST IMPORTANT. This is the mean of the geometric distribution
 
-# change these in ablations (to shape what kind of 'average investor' we are modeling)
+# change these in ablations to shape what kind of 'average investor' we are modeling
 COUNTRIES = ['Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
              'Denmark', 'Spain', 'Finland', 'France', 'UK',
              'Ireland', 'Italy', 'Japan', 'Netherlands', 'Norway',
              'Portugal', 'Sweden', 'USA']
 
+# for now: pick countries with uniform probability
 COUNTRY_PROBABILITIES_UNIFORM = [1/len(COUNTRIES) for _ in range(len(COUNTRIES))]
 
 # set seed for debugging
-SEED = 42
+SEED = 41
 np.random.seed(SEED)
 
 
@@ -97,14 +98,14 @@ class SimulatedInvestor:
                  sigma=SIGMA,
                  mu=MU,
                  shape=SHAPE,
-                 should_maximize_entropy=False):
+                 is_entropy_maximizing=False):
 
         self.min_year = min_year
         self.max_year = max_year
 
         self.age_at_start = age_at_start
         self.avg_residence_length = avg_residence_length
-        self.should_maximize_entropy = should_maximize_entropy
+        self.is_entropy_maximizing = is_entropy_maximizing
 
         self.countries = countries
         self.country_probabilities = country_probabilities
@@ -147,6 +148,7 @@ class SimulatedInvestor:
 
             Round T down
         """
+
         # keep generating until 't' is non-negative
         numerator = 0
 
@@ -177,12 +179,14 @@ class SimulatedInvestor:
             if self.time_after_retirement(t) > 0:
                 return self.time_after_retirement(t)
 
-    ### MAXIMUM ENTROPY MODIFICATION OF TRAJECTORIES ###
+    ################################################
+    # MAXIMUM ENTROPY MODIFICATION OF TRAJECTORIES #
+    ################################################
     # returns perturbed version of the trajectory that has, for each dimension,
     # the same relative temporal ordering of values.
 
     @staticmethod
-    def resample_with_max_entropy(trajectory):  # trajectory an np array of shape (N, D)
+    def resample_with_max_entropy(trajectory):  # `trajectory' is an np array of shape (N, D)
         # WARNING: method assumes no duplicate values per dimension!
         n, d = trajectory.shape
 
@@ -220,15 +224,16 @@ class SimulatedInvestor:
 
         return perturbed_trajectory
 
-    ### BLOCK BOOTSTRAP METHOD ###
+    ##########################
+    # BLOCK BOOTSTRAP METHOD #
+    ##########################
     def get_trajectory(self, total_time_steps: int):
         """
             'observation' = asset returns AND macro variable returns (used to be called 'state')
             if should_maximize_entropy == True, apply the static method above before returning
         """
 
-        # returns sequence of observations (about 30 in length) for one investor's life
-
+        # returns sequence of observations (about 20 in length) for one investor's life
         time_series_of_observations = np.zeros(shape=(total_time_steps, self.observation_dimension), dtype=np.float32)
         time_elapsed = 0
 
@@ -295,13 +300,59 @@ class SimulatedInvestor:
                 if time_elapsed == total_time_steps:
                     break
 
-        if self.should_maximize_entropy:
+        if self.is_entropy_maximizing:
             time_series_of_observations = self.resample_with_max_entropy(time_series_of_observations)
 
         return time_series_of_observations
 
+    # synthetic validation regimes
+    @staticmethod
+    def get_synthetic_distribution(synthetic_mode):
+        mu_1, mu_2, sigma_1, sigma_2, rho = 0, 0, 0, 0, 0
 
-### III. SOME ILLUSTRATIONS ###
+        if synthetic_mode == 'delta functions':
+            # best strategy (simple rewards):....
+            mu_1 = -0.4
+            mu_2 = 0.1
+            sigma_1 = 0
+            sigma_2 = 0
+            rho = 0
+
+        elif synthetic_mode == 'correlated gaussians':
+            # best constant strategy (simple rewards)
+            mu_1 = 0.05
+            mu_2 = 0.05
+            sigma_1 = 0.2
+            sigma_2 = 0
+            rho = 1
+
+        elif synthetic_mode == 'anticorrelated gaussians':
+            # best constant strategy (simple rewards): 50% action_1
+            mu_1 = 0.05
+            mu_2 = 0.05
+            sigma_1 = 0.2
+            sigma_2 = 0.2
+            rho = -1
+
+        return mu_1, mu_2, sigma_1, sigma_2, rho
+
+    def get_synthetic_trajectory(self, total_time_steps, synthetic_mode):
+        mu_1, mu_2, sigma_1, sigma_2, rho = self.get_synthetic_distribution(synthetic_mode)
+
+        mean = np.array([mu_1, mu_2])
+        cov = np.array([[sigma_1 ** 2, rho * sigma_1 * sigma_2],
+                        [rho * sigma_1 * sigma_2, sigma_2 ** 2]])
+
+        time_series_of_observations = np.random.multivariate_normal(mean=mean,
+                                                                    cov=cov,
+                                                                    size=total_time_steps)  # (T, 2)
+
+        return time_series_of_observations
+
+###########################
+# III. SOME ILLUSTRATIONS #
+###########################
+
 
 def sanity_check():
     # Sanity check: generate investors and lifetimes, and see if distributions look reasonable
