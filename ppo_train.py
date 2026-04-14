@@ -9,7 +9,7 @@ Key changes:
   - PPO instead of off-policy Actor-Critic
   - Wealth normalized by STARTING_WEALTH so the network sees ~O(1) inputs
   - Collects a batch of trajectories, then does multiple PPO epochs on the batch
-  - Cleaner metric tracking and plotting
+  - Cleaner metric tracking and plotting :)
 """
 
 import torch
