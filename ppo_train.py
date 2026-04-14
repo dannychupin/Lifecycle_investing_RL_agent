@@ -1,133 +1,379 @@
+"""
+PPO Training for Retirement Portfolio Allocation
+=================================================
+
+Drop-in replacement for ac_train.py.  Uses the same block_bootstrap.SimulatedInvestor
+environment interface.
+
+Key changes:
+  - PPO instead of off-policy Actor-Critic
+  - Wealth normalized by STARTING_WEALTH so the network sees ~O(1) inputs
+  - Collects a batch of trajectories, then does multiple PPO epochs on the batch
+  - Cleaner metric tracking and plotting
+"""
+
 import torch
 import numpy as np
-import time
 import pandas as pd
 import matplotlib.pyplot as plt
+import os
+import time
+
 from block_bootstrap import SimulatedInvestor
 from ppo_agent import PPOAgent
 
-# set seed for debugging
+# reproducibility
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# enable anomaly detection to catch unhandled NaNs at their source
-torch.autograd.set_detect_anomaly(True)
 
-# key numbers
-ACTION_DIMENSION = 4
-STATE_DIMENSION = 8
+# ===========================================================================
+# Configuration
+# ===========================================================================
 
-# set training parameters
-NUM_TRAJECTORIES = 5_000
-CAUTION = 0       
-BETA = 0.04
-STARTING_WEALTH = 1_000_000
+# --- assets & countries (same as original) ---
 
-investor = SimulatedInvestor()
-agent = PPOAgent(state_size=STATE_DIMENSION, action_size=ACTION_DIMENSION)
-timesteps_per_batch = 400
+ALLOWED_COUNTRIES = [
+    'Australia', 'Belgium', 'Canada', 'Switzerland', 'Germany',
+    'Denmark', 'Spain', 'Finland', 'France', 'UK',
+    'Ireland', 'Italy', 'Japan', 'Netherlands', 'Norway',
+    'Portugal', 'Sweden', 'USA',
+]
 
-def get_financial_update(state, action_old, withdraw_old, wealth_old):
-    asset_returns = state[:4]
-    inflation_rate = state[4]
-    withdraw = (1 + inflation_rate) * withdraw_old
-    wealth = wealth_old * (1 + np.dot(asset_returns, action_old)) - withdraw
-    
-    # Scale the reward
-    reward = (wealth - wealth_old) / wealth_old
-    
-    return reward, withdraw, wealth
+ALLOWED_ASSETS = [
+    ['eq_tr', 'eq_capgain', 'eq_div_rtn'],     # stocks
+    ['bond_tr', 'bond_rate'],                    # bonds
+]
 
-avg_actions = np.zeros((NUM_TRAJECTORIES, 4), dtype=np.float32)
-financial_ruin = np.zeros(NUM_TRAJECTORIES, dtype=np.float32)
-terminal_wealth = np.zeros(NUM_TRAJECTORIES, dtype=np.float32)
+ALLOWED_MACROS = [['cpi']]   # inflation must be last
 
-def train():
-    start_time = time.time()
-    print('Beginning training...')
-    step_ticker = 0
+ACTION_DIM = len(ALLOWED_ASSETS)                       # 2 (stocks, bonds)
+OBS_DIM    = len(ALLOWED_ASSETS) + len(ALLOWED_MACROS) - 1   # real returns (no inflation col)
+STATE_DIM  = OBS_DIM + 1                               # + normalized wealth
 
-    for i in range(NUM_TRAJECTORIES):
+# --- financial parameters ---
+
+STARTING_WEALTH = 1_000_000.0
+BETA            = 0.04
+WITHDRAW        = BETA * STARTING_WEALTH               # 40,000 real $/year
+
+# --- reward ---
+
+REWARD_TYPE = 'simple'    # 'simple' (survive/ruin) or 'wealth' (delta W)
+PENALTY     = 100         # penalty per remaining year on ruin
+
+# --- PPO hyperparameters ---
+
+HIDDEN_DIM      = 32
+DIST_TYPE       = 'gaussian'     # 'gaussian' or 'dirichlet'
+LR              = 3e-4
+GAMMA           = 0.99
+GAE_LAMBDA      = 0.95
+CLIP_EPS        = 0.2
+PPO_EPOCHS      = 4              # gradient epochs per batch
+MINIBATCH_SIZE  = 128
+VALUE_COEF      = 0.5
+MAX_GRAD_NORM   = 0.5
+
+# --- training schedule ---
+
+TRAJS_PER_BATCH = 40             # episodes collected before each PPO update
+NUM_BATCHES     = 300            # total PPO updates
+TOTAL_TRAJS     = TRAJS_PER_BATCH * NUM_BATCHES   # 4000 episodes total
+
+# --- output ---
+
+CHECKPOINT_PATH = 'PPO_weights/checkpoint.pt'
+GRAPH_DIR       = 'PPO_graphs'
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def nominal_to_real(observation):
+    """Convert nominal observation (with inflation as last entry) to real returns."""
+    inflation = observation[-1]
+    return observation[:-1] - inflation
+
+
+def make_state(real_obs, wealth):
+    """Bundle real returns + normalized wealth into a state vector."""
+    norm_wealth = wealth / STARTING_WEALTH    # <-- the key fix: O(1) scale
+    return np.concatenate([real_obs, [norm_wealth]], dtype=np.float32)
+
+
+def financial_update(real_obs, action, wealth_old):
+    """Apply portfolio return and withdrawal.  Returns new wealth (not clipped)."""
+    asset_returns = real_obs[:ACTION_DIM]
+    portfolio_return = np.dot(asset_returns, action)
+    return wealth_old * (1.0 + portfolio_return) - WITHDRAW
+
+
+def compute_reward(wealth_new, wealth_old, time_remaining, reward_type, penalty):
+    if reward_type == 'simple':
+        if wealth_new > 0:
+            return 1.0
+        else:
+            return -penalty * time_remaining
+
+    elif reward_type == 'wealth':
+        if wealth_new >= 0:
+            return (wealth_new - wealth_old) / STARTING_WEALTH
+        else:
+            return 0.0
+
+
+# ===========================================================================
+# Trainer
+# ===========================================================================
+
+class Trainer:
+
+    def __init__(self, reward_type=REWARD_TYPE, penalty=PENALTY):
+        self.reward_type = reward_type
+        self.penalty = penalty
+
+        self.investor = SimulatedInvestor(
+            countries=ALLOWED_COUNTRIES,
+            asset_proxy_list=ALLOWED_ASSETS,
+            macro_list=ALLOWED_MACROS,
+            should_maximize_entropy=False,
+        )
+
+        self.agent = PPOAgent(
+            state_dim=STATE_DIM,
+            action_dim=ACTION_DIM,
+            hidden_dim=HIDDEN_DIM,
+            dist_type=DIST_TYPE,
+            lr=LR,
+            gamma=GAMMA,
+            gae_lambda=GAE_LAMBDA,
+            clip_eps=CLIP_EPS,
+            ppo_epochs=PPO_EPOCHS,
+            minibatch_size=MINIBATCH_SIZE,
+            value_coef=VALUE_COEF,
+            max_grad_norm=MAX_GRAD_NORM,
+        )
+
+        # per-episode metrics  (one entry per episode)
+        self.history = {
+            'terminal_wealth': [],
+            'ruin':            [],      # 1 if went broke, else 0
+            'avg_stock_alloc': [],
+            'avg_bond_alloc':  [],
+            'episode_length':  [],
+        }
+        # per-batch metrics  (one entry per PPO update)
+        self.train_stats = {
+            'policy_loss': [],
+            'value_loss':  [],
+            'clip_frac':   [],
+        }
+
+    # ----- run one episode, storing transitions in the agent's buffer -----
+
+    def _run_episode(self):
+        """Roll out one episode. Returns (terminal_wealth, ruin, avg_actions)."""
+        traj_len = self.investor.generate_time_after_retirement()
+        if traj_len <= 1:
+            return None   # skip degenerate episodes
+
+        observations = self.investor.get_trajectory(traj_len)
         wealth = STARTING_WEALTH
-        withdraw = BETA * STARTING_WEALTH
-        action_sum = np.array([0., 0., 0., 0.])
+        actions_taken = []
 
-        trajectory_length = investor.generate_time_after_retirement()
-        trajectory_states = investor.get_trajectory(trajectory_length)
+        for t in range(traj_len - 1):
+            # state
+            real_obs = nominal_to_real(observations[t])
+            state = make_state(real_obs, wealth)
 
-        for t in range(trajectory_length - 1):
-            state = trajectory_states[t]
-            new_state = trajectory_states[t + 1]
+            # act
+            action, log_prob, value = self.agent.act(state)
+            actions_taken.append(action)
 
-            if i <= CAUTION:
-                action = np.array([0., 0., 0., 1.])
-                reward, withdraw, wealth = get_financial_update(new_state, action, withdraw, wealth)
-                if wealth <= 0: break
-                continue
+            # environment step
+            real_obs_next = nominal_to_real(observations[t + 1])
+            wealth_new = financial_update(real_obs_next, action, wealth)
+            wealth_new = np.clip(wealth_new, 0.0, 10 * STARTING_WEALTH)
 
-            action, log_prob, value = agent.get_action_and_value(state)
-            action_sum += action
-            
-            reward, withdraw, wealth = get_financial_update(new_state, action, withdraw, wealth)
-            is_done = wealth <= 0
+            # reward
+            reward = compute_reward(
+                wealth_new, wealth, traj_len - t,
+                self.reward_type, self.penalty,
+            )
 
-            agent.store_transition(state, action, reward, is_done, log_prob, value)
-            step_ticker += 1
+            # done?
+            is_done = (wealth_new == 0.0) or (t + 1 == traj_len - 1)
 
-            if step_ticker % timesteps_per_batch == 0:
-                _, _, next_value = agent.get_action_and_value(new_state)
-                agent.update(next_value)
+            # next state (only needed to store in buffer for the value baseline)
+            state_next = make_state(real_obs_next, wealth_new)
 
-            if is_done:
-                print(f'Oh no! Life {i} ends in financial ruin! Ends with wealth {wealth}')
-                financial_ruin[i] = 1
+            # store
+            self.agent.buffer.store(state, action, log_prob, reward,
+                                    float(is_done), value)
+            wealth = wealth_new
+
+            if wealth == 0.0:
                 break
 
-            if t == trajectory_length - 2:
-                print(f'Life {i} ends with wealth {wealth}')
-                terminal_wealth[i] = wealth
+        actions_arr = np.array(actions_taken)
+        ruin = 1 if wealth == 0.0 else 0
+        return wealth, ruin, actions_arr.mean(axis=0)
 
-        sum_of_action_sums = np.sum(action_sum)
-        if sum_of_action_sums > 0:
-            avg_actions[i, :] = action_sum / sum_of_action_sums
+    # ----- main training loop -----
 
-        if (i + 1) % 25 == 0:
-            agent.save_checkpoint()
-            print(f'...Saving checkpoint. Time elapsed: {time.time() - start_time:.2f} seconds')
+    def train(self):
+        start = time.time()
+        print(f'PPO training: {NUM_BATCHES} batches x {TRAJS_PER_BATCH} episodes '
+              f'= {TOTAL_TRAJS} episodes')
+        print(f'Reward: {self.reward_type}  |  Penalty: {self.penalty}  |  '
+              f'Dist: {DIST_TYPE}  |  LR: {LR}')
+        print('-' * 60)
 
-    print(f'TRAINING COMPLETE. Time elapsed: {time.time() - start_time:.2f} seconds.')
+        for batch in range(NUM_BATCHES):
+            # ---- collect ----
+            batch_wealth = []
+            batch_ruin = []
+            batch_stock = []
+            batch_bond = []
 
-train()
+            for _ in range(TRAJS_PER_BATCH):
+                result = self._run_episode()
+                if result is None:
+                    continue
+                w, r, avg_a = result
+                batch_wealth.append(w)
+                batch_ruin.append(r)
+                batch_stock.append(avg_a[0])
+                batch_bond.append(avg_a[1])
 
-# calculate rolling average for financial ruin and terminal wealth
-window = 50
+            # ---- PPO update ----
+            if len(self.agent.buffer) > 0:
+                stats = self.agent.update()
+                self.train_stats['policy_loss'].append(stats['policy_loss'])
+                self.train_stats['value_loss'].append(stats['value_loss'])
+                self.train_stats['clip_frac'].append(stats['clip_frac'])
 
-fin_ruin_pd = pd.Series(financial_ruin)
-roll_fr = fin_ruin_pd.rolling(window=window, min_periods=1).mean()
+            # ---- record ----
+            self.history['terminal_wealth'].extend(batch_wealth)
+            self.history['ruin'].extend(batch_ruin)
+            self.history['avg_stock_alloc'].extend(batch_stock)
+            self.history['avg_bond_alloc'].extend(batch_bond)
+            self.history['episode_length'].extend([0] * len(batch_wealth))  # placeholder
 
-term_wealth_pd = pd.Series(terminal_wealth)
-roll_tw = term_wealth_pd.rolling(window=window, min_periods=1).mean()
+            # ---- log ----
+            if (batch + 1) % 10 == 0 or batch == 0:
+                ruin_rate = np.mean(batch_ruin) if batch_ruin else 0
+                avg_w = np.mean(batch_wealth) if batch_wealth else 0
+                avg_s = np.mean(batch_stock) if batch_stock else 0
+                elapsed = time.time() - start
+                print(f'  batch {batch+1:4d}/{NUM_BATCHES}  '
+                      f'ruin={ruin_rate:.2f}  '
+                      f'wealth={avg_w:,.0f}  '
+                      f'stock={avg_s:.2f}  '
+                      f'ploss={stats["policy_loss"]:.4f}  '
+                      f'vloss={stats["value_loss"]:.4f}  '
+                      f'clip={stats["clip_frac"]:.2f}  '
+                      f'[{elapsed:.0f}s]')
 
-legend = ['stocks', 'housing', 'bonds', 'bills']
+        elapsed = time.time() - start
+        print('-' * 60)
+        print(f'Done in {elapsed:.1f}s  ({elapsed/TOTAL_TRAJS:.3f}s/episode)')
 
-fig, axes = plt.subplots(3, 2, sharex=True, figsize=(13, 7))
-axes = axes.ravel()
+        # save
+        os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
+        self.agent.save(CHECKPOINT_PATH)
+        print(f'Checkpoint saved to {CHECKPOINT_PATH}')
 
-for i, ax in enumerate(axes):
-    if i <= 3:
-        ax.plot(avg_actions[:, i])
-        ax.set_title(f'Avg weight accorded to {legend[i]}')
+    # ----- plotting -----
+
+    def plot(self, window=100, save=True, show=False):
+        fig, axes = plt.subplots(2, 3, figsize=(14, 7), sharex='col')
+        fig.suptitle(
+            f'PPO  |  {DIST_TYPE}  |  reward={self.reward_type}  |  '
+            f'penalty={self.penalty}  |  lr={LR}',
+            fontsize=13,
+        )
+
+        def rolling(data, w=window):
+            return pd.Series(data).rolling(w, min_periods=1).mean()
+
+        # --- stock allocation ---
+        ax = axes[0, 0]
+        s = rolling(self.history['avg_stock_alloc'])
+        ax.plot(s, linewidth=0.8)
         ax.set_ylim(0, 1)
-        ax.grid(True, alpha=0.3)
-    if i == 4:
-        ax.plot(roll_tw)
-        ax.set_title(f'{window}-point rolling terminal wealth')
-        ax.grid(True, alpha=0.3)
-    if i == 5:
-        ax.plot(roll_fr)
-        ax.set_title(f'{window}-point prob of financial ruin')
+        ax.set_title('Stock allocation (rolling avg)')
         ax.grid(True, alpha=0.3)
 
-fig.tight_layout()
-plt.show()
+        # --- bond allocation ---
+        ax = axes[1, 0]
+        b = rolling(self.history['avg_bond_alloc'])
+        ax.plot(b, linewidth=0.8, color='tab:orange')
+        ax.set_ylim(0, 1)
+        ax.set_title('Bond allocation (rolling avg)')
+        ax.set_xlabel('Episode')
+        ax.grid(True, alpha=0.3)
+
+        # --- terminal wealth ---
+        ax = axes[0, 1]
+        ax.plot(rolling(self.history['terminal_wealth']), linewidth=0.8, color='tab:green')
+        ax.set_title('Terminal wealth (rolling avg)')
+        ax.grid(True, alpha=0.3)
+
+        # --- ruin rate ---
+        ax = axes[1, 1]
+        ax.plot(rolling(self.history['ruin']), linewidth=0.8, color='tab:red')
+        ax.set_ylim(0, max(0.25, max(self.history['ruin']) + 0.05))
+        ax.set_title('Ruin probability (rolling avg)')
+        ax.set_xlabel('Episode')
+        ax.grid(True, alpha=0.3)
+
+        # --- policy loss ---
+        ax = axes[0, 2]
+        ax.plot(self.train_stats['policy_loss'], linewidth=0.8, color='tab:purple')
+        ax.set_title('Policy loss (per PPO update)')
+        ax.grid(True, alpha=0.3)
+
+        # --- value loss ---
+        ax = axes[1, 2]
+        ax.plot(self.train_stats['value_loss'], linewidth=0.8, color='tab:brown')
+        ax.set_title('Value loss (per PPO update)')
+        ax.set_xlabel('PPO update')
+        ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+
+        if save:
+            os.makedirs(GRAPH_DIR, exist_ok=True)
+            fname = (f'{DIST_TYPE}_reward={self.reward_type}_'
+                     f'penalty={self.penalty}_lr={LR}.png')
+            path = os.path.join(GRAPH_DIR, fname)
+            plt.savefig(path, dpi=150)
+            print(f'Plot saved to {path}')
+
+        if show:
+            plt.show()
+
+        plt.close(fig)
+
+
+# ===========================================================================
+# Run
+# ===========================================================================
+
+if __name__ == '__main__':
+
+    # single run with good defaults
+    trainer = Trainer(reward_type=REWARD_TYPE, penalty=PENALTY)
+    trainer.train()
+    trainer.plot(window=100, save=True, show=False)
+
+    # uncomment for a small hyperparameter sweep:
+    # for penalty in [1, 5, 10]:
+    #     for reward_type in ['simple', 'wealth']:
+    #         trainer = Trainer(reward_type=reward_type, penalty=penalty)
+    #         trainer.train()
+    #         trainer.plot(save=True)

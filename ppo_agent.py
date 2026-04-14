@@ -1,210 +1,275 @@
+"""
+PPO Agent for Retirement Portfolio Allocation
+==============================================
+
+Replaces the off-policy Actor-Critic with on-policy PPO.
+
+Key improvements over the original ac_agent.py:
+  - On-policy: no replay buffer, no target networks, no distribution shift
+  - Wealth normalized to O(1) before entering networks
+  - Per-dimension std in the Gaussian policy (not isotropic)
+  - GAE for stable advantage estimation
+  - Larger hidden layers (32 vs 8)
+  - Tanh activations (bounded gradients, standard for PPO)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Dirichlet
-import torch.optim as optim
+from torch.distributions import Normal, Independent, TransformedDistribution, Dirichlet
+from torch.distributions.transforms import StickBreakingTransform
 import numpy as np
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print("device is:", device)
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, s_size, a_size, fc1_units=64, fc2_units=64, alpha_min=1.01):
+    """
+    State -> distribution on the action simplex.
+
+    'gaussian':  Gaussian in R^{A-1}, then stick-breaking onto the simplex.
+                 For 2 assets this is a logistic-normal (sigmoid of a Gaussian).
+    'dirichlet': Dirichlet directly on the simplex.
+    """
+
+    def __init__(self, state_dim, action_dim, hidden_dim=32, dist_type='gaussian'):
         super().__init__()
-        self.alpha_min = alpha_min
-        
-        self.mlp_base = nn.Sequential(
-            nn.Linear(in_features=s_size, out_features=fc1_units),
+        self.dist_type = dist_type
+
+        self.trunk = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(in_features=fc1_units, out_features=fc2_units),
-            nn.Tanh()
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
         )
-        self.actor_mean_head = nn.Linear(in_features=fc2_units, out_features=a_size)
-        self.actor_concentration_head = nn.Linear(in_features=fc2_units, out_features=1)
+
+        if dist_type == 'gaussian':
+            self.mean_head = nn.Linear(hidden_dim, action_dim - 1)
+            self.log_std_head = nn.Linear(hidden_dim, action_dim - 1)
+            self.stick_break = StickBreakingTransform()
+        elif dist_type == 'dirichlet':
+            self.alpha_head = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, state):
-        h = self.mlp_base(state)
+        h = self.trunk(state)
 
-        mean_action = F.softmax(self.actor_mean_head(h), dim=-1)
+        if self.dist_type == 'gaussian':
+            mean = self.mean_head(h)
+            std = F.softplus(self.log_std_head(h)) + 1e-3
+            base = Independent(Normal(mean, std), reinterpreted_batch_ndims=1)
+            return TransformedDistribution(base, [self.stick_break])
+        else:
+            alpha = F.softplus(self.alpha_head(h)) + 0.01
+            return Dirichlet(alpha)
 
-        # Clamp concentration BEFORE softplus to prevent overflow.
-        raw_concentration_logit = torch.clamp(
-            self.actor_concentration_head(h), min=-20.0, max=20.0
-        )
-        concentration_action = F.softplus(raw_concentration_logit)
-
-        alpha_action = (concentration_action * mean_action) + self.alpha_min
-
-        self.dist = Dirichlet(alpha_action)
-        return mean_action
-
-    def get_dist(self, state):
-        self.forward(state)
-        return self.dist
-
-    def select_greedy_action(self, state):
-        state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        mu = self.forward(state_t)
-        return mu.squeeze(0).detach().cpu().numpy()
 
 class ValueNetwork(nn.Module):
-    def __init__(self, s_size, fc1_units=64, fc2_units=64):
-        super(ValueNetwork, self).__init__()
-        self.fc1 = nn.Linear(s_size, fc1_units)
-        self.fc2 = nn.Linear(fc1_units, fc2_units)
-        self.fc3 = nn.Linear(fc2_units, 1)
+    """State -> scalar value estimate V(s)."""
+
+    def __init__(self, state_dim, hidden_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        return self.net(state).squeeze(-1)
 
-class PPOAgent():
-    def __init__(
-        self,
-        state_size,
-        action_size,
-        lr=3e-5,
-        v_lr=5e-5,
-        clip_epsilon=0.2,
-        ppo_epochs=10,
-        minibatch_size=64,
-        lam=0.95,
-        gamma=0.99,
-        value_coeff=0.5,
-        entropy_coeff=0.01,
-    ):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.lr = lr
-        self.v_lr = v_lr
-        self.pnetwork = PolicyNetwork(state_size, action_size).to(device)
-        self.vnetwork = ValueNetwork(state_size).to(device)
-        self.poptimizer = optim.Adam(self.pnetwork.parameters(), lr=self.lr)
-        self.voptimizer = optim.Adam(self.vnetwork.parameters(), lr=self.v_lr)
 
-        self.clear_buffers()
+# ---------------------------------------------------------------------------
+# Rollout buffer  (on-policy: filled once, used for update, then cleared)
+# ---------------------------------------------------------------------------
 
-        self.clip_epsilon = clip_epsilon
-        self.ppo_epochs = ppo_epochs
-        self.minibatch_size = minibatch_size
-        self.lam = lam
-        self.gamma = gamma
-        self.value_coeff = value_coeff
-        self.entropy_coeff = entropy_coeff
+class RolloutBuffer:
 
-    def clear_buffers(self):
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.log_probs = []
-        self.values = []
+    def __init__(self):
+        self.clear()
 
-    def get_action_and_value(self, state):
-        state_t = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        with torch.no_grad():
-            dist = self.pnetwork.get_dist(state_t)
-            value_t = self.vnetwork(state_t).squeeze(0)
-            
-            raw_action = dist.sample()
-            action_t = torch.clamp(raw_action, min=1e-5)
-            action_t = action_t / action_t.sum(dim=-1, keepdim=True)
-            
-            logprob_t = dist.log_prob(action_t).sum(dim=-1)
-            
-        return action_t.squeeze(0).cpu().numpy(), logprob_t.squeeze(0).cpu().item(), value_t.cpu().item()
-
-    def store_transition(self, state, action, reward, done, log_prob, value):
+    def store(self, state, action, log_prob, reward, done, value):
         self.states.append(state)
         self.actions.append(action)
-        self.rewards.append(float(reward))
-        self.dones.append(bool(done))
-        self.log_probs.append(float(log_prob))
-        self.values.append(float(value))
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
 
-    def compute_gae(self, last_value):
-        raw_rewards = np.array(self.rewards, dtype=np.float32)
-        rewards = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
-        values = self.values
-        dones = self.dones
-        gamma = self.gamma
-        lam = self.lam
+    def clear(self):
+        self.states = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
 
-        N = len(rewards)
-        advantages = np.zeros(N, dtype=np.float32)
-        last_gae = 0.0
-        for t in reversed(range(N)):
-            next_value = last_value if t == N - 1 else values[t + 1]
-            next_nonterminal = 0.0 if dones[t] else 1.0
+    def as_tensors(self):
+        return (
+            torch.tensor(np.array(self.states),   dtype=torch.float32),
+            torch.tensor(np.array(self.actions),   dtype=torch.float32),
+            torch.tensor(np.array(self.log_probs), dtype=torch.float32),
+            torch.tensor(np.array(self.rewards),   dtype=torch.float32),
+            torch.tensor(np.array(self.dones),     dtype=torch.float32),
+            torch.tensor(np.array(self.values),    dtype=torch.float32),
+        )
 
-            delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
-            last_gae = delta + gamma * lam * next_nonterminal * last_gae
-            advantages[t] = last_gae
+    def __len__(self):
+        return len(self.states)
 
-        returns = advantages + np.array(values, dtype=np.float32)
-        adv_tensor = torch.tensor(advantages, dtype=torch.float32, device=device)
-        ret_tensor = torch.tensor(returns, dtype=torch.float32, device=device)
 
-        adv_tensor = (adv_tensor - adv_tensor.mean()) / (adv_tensor.std(unbiased=False) + 1e-8)
-        return adv_tensor, ret_tensor
+# ---------------------------------------------------------------------------
+# GAE  (Schulman et al., 2016)
+# ---------------------------------------------------------------------------
 
-    def update(self, last_value):
-        if len(self.states) == 0:
-            return
+def compute_gae(rewards, values, dones, gamma, lam):
+    T = len(rewards)
+    advantages = torch.zeros(T)
+    last_adv = 0.0
 
-        advantages, returns = self.compute_gae(last_value)
-        states = torch.tensor(np.array(self.states), dtype=torch.float32, device=device)
-        actions = torch.tensor(np.array(self.actions), dtype=torch.float32, device=device)
-        old_log_probs = torch.tensor(self.log_probs, dtype=torch.float32, device=device)
+    for t in reversed(range(T)):
+        mask = 1.0 - dones[t]                                  # 0 at episode end
+        next_val = values[t + 1] if t + 1 < T else 0.0
+        delta = rewards[t] + gamma * next_val * mask - values[t]
+        advantages[t] = last_adv = delta + gamma * lam * mask * last_adv
 
-        N = states.shape[0]
-        batch_size = self.minibatch_size
+    returns = advantages + values
+    return advantages, returns
 
-        for epoch in range(self.ppo_epochs):
-            perm = np.random.permutation(N)
-            for start in range(0, N, batch_size):
-                idx = perm[start:start + batch_size]
-                idx = torch.tensor(idx, dtype=torch.long, device=device)
 
-                b_states = states[idx]
-                b_actions = actions[idx]
-                b_oldlogp = old_log_probs[idx]
-                b_adv = advantages[idx]
-                b_ret = returns[idx]
+# ---------------------------------------------------------------------------
+# PPO Agent
+# ---------------------------------------------------------------------------
 
-                b_actions_safe = torch.clamp(b_actions, min=1e-5)
-                b_actions_safe = b_actions_safe / b_actions_safe.sum(dim=-1, keepdim=True)
+class PPOAgent:
+    """
+    Proximal Policy Optimization (clip variant).
 
-                dist = self.pnetwork.get_dist(b_states)
-                new_logp = dist.log_prob(b_actions_safe).sum(dim=-1)
-                entropy = dist.entropy().mean()
+    Typical usage:
+        agent = PPOAgent(state_dim=3, action_dim=2)
 
-                # CLAMP THE EXPONENT directly to prevent backward pass NaN explosions.
-                # ln(10) is roughly 2.302585
-                log_ratio = torch.clamp(new_logp - b_oldlogp, max=2.302585)
-                ratio = torch.exp(log_ratio)
+        # collect
+        for episode:
+            for step:
+                action, lp, val = agent.act(state)
+                agent.buffer.store(state, action, lp, reward, done, val)
 
-                surr1 = ratio * b_adv
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * b_adv
+        # update
+        stats = agent.update()
+    """
+
+    def __init__(self, state_dim, action_dim,
+                 hidden_dim=32,
+                 dist_type='gaussian',
+                 lr=3e-4,
+                 gamma=0.99,
+                 gae_lambda=0.95,
+                 clip_eps=0.2,
+                 ppo_epochs=4,
+                 minibatch_size=128,
+                 value_coef=0.5,
+                 max_grad_norm=0.5):
+
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_eps = clip_eps
+        self.ppo_epochs = ppo_epochs
+        self.minibatch_size = minibatch_size
+        self.value_coef = value_coef
+        self.max_grad_norm = max_grad_norm
+        self.dist_type = dist_type
+
+        self.policy = PolicyNetwork(state_dim, action_dim, hidden_dim, dist_type)
+        self.value_net = ValueNetwork(state_dim, hidden_dim)
+
+        self.optimizer = torch.optim.Adam(
+            list(self.policy.parameters()) + list(self.value_net.parameters()),
+            lr=lr,
+        )
+        self.buffer = RolloutBuffer()
+
+    @torch.no_grad()
+    def act(self, state_np):
+        """Sample an action. Returns (action_np, log_prob, value)."""
+        state = torch.tensor(state_np, dtype=torch.float32).unsqueeze(0)
+        dist = self.policy(state)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        value = self.value_net(state)
+        return action.squeeze(0).numpy(), log_prob.item(), value.item()
+
+    def update(self):
+        """Run clipped PPO on the current buffer. Returns dict of mean losses."""
+        states, actions, old_lp, rewards, dones, values = self.buffer.as_tensors()
+
+        advantages, returns = compute_gae(
+            rewards, values, dones, self.gamma, self.gae_lambda
+        )
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        n = len(states)
+        stats = {'policy_loss': [], 'value_loss': [], 'clip_frac': []}
+
+        for _ in range(self.ppo_epochs):
+            perm = np.random.permutation(n)
+            for start in range(0, n, self.minibatch_size):
+                idx = perm[start : start + self.minibatch_size]
+
+                mb_s   = states[idx]
+                mb_a   = actions[idx]
+                mb_olp = old_lp[idx]
+                mb_adv = advantages[idx]
+                mb_ret = returns[idx]
+
+                # -- policy loss --
+                dist = self.policy(mb_s)
+
+                # clamp actions off simplex boundary for numerical safety
+                safe_a = mb_a.clamp(1e-6, 1 - 1e-6)
+                safe_a = safe_a / safe_a.sum(-1, keepdim=True)
+
+                new_lp = dist.log_prob(safe_a)
+                ratio = torch.exp(new_lp - mb_olp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_pred = self.vnetwork(b_states).squeeze(-1)
-                value_loss = F.mse_loss(value_pred, b_ret)
+                # -- value loss --
+                value_loss = F.mse_loss(self.value_net(mb_s), mb_ret)
 
-                self.poptimizer.zero_grad()
-                (policy_loss - self.entropy_coeff * entropy).backward()
-                nn.utils.clip_grad_norm_(self.pnetwork.parameters(), 0.5)
-                self.poptimizer.step()
+                # -- step --
+                loss = policy_loss + self.value_coef * value_loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                #nn.utils.clip_grad_norm_(
+                #    list(self.policy.parameters()) + list(self.value_net.parameters()),
+                #    self.max_grad_norm,
+                #)
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                self.optimizer.step()
 
-                self.voptimizer.zero_grad()
-                (self.value_coeff * value_loss).backward()
-                nn.utils.clip_grad_norm_(self.vnetwork.parameters(), 0.5)
-                self.voptimizer.step()
+                with torch.no_grad():
+                    cf = ((ratio - 1.0).abs() > self.clip_eps).float().mean().item()
+                stats['policy_loss'].append(policy_loss.item())
+                stats['value_loss'].append(value_loss.item())
+                stats['clip_frac'].append(cf)
 
-        self.clear_buffers()
+        self.buffer.clear()
+        return {k: np.mean(v) for k, v in stats.items()}
 
-    def save_checkpoint(self, p_path='policy.pth', v_path='value.pth'):
-        torch.save(self.pnetwork.state_dict(), p_path)
-        torch.save(self.vnetwork.state_dict(), v_path)
+    def save(self, path):
+        torch.save({
+            'policy': self.policy.state_dict(),
+            'value_net': self.value_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, weights_only=False)
+        self.policy.load_state_dict(ckpt['policy'])
+        self.value_net.load_state_dict(ckpt['value_net'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])
